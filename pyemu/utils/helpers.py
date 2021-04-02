@@ -6948,6 +6948,6 @@ class GsfReader():
         for node in range(self.nnode):
             nid, x, y, z, lay, numverts = self.read_data[self.nvertex + 3 + node].split()[:6]
 
-            node_coords[nid] = [float(x), float(y)]
+            node_coords[int(nid)] = [float(x), float(y)]
 
         return node_coords
