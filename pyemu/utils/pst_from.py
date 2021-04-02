@@ -1,5 +1,6 @@
 from __future__ import print_function, division
 import os
+from pathlib import Path
 from datetime import datetime
 import shutil
 import inspect
@@ -17,7 +18,7 @@ import string
 # the tolerable percent difference (100 * (max - min)/mean)
 # used when checking that constant and zone type parameters are in fact constant (within
 # a given zone)
-# DIRECT_PAR_PERCENT_DIFF_TOL = 1.0
+DIRECT_PAR_PERCENT_DIFF_TOL = 1.0
 
 
 def _get_datetime_from_str(sdt):
@@ -58,6 +59,24 @@ class PstFrom(object):
         zero_based (`bool`): flag if the model uses zero-based indices, Default is True
         start_datetime (`str`): a string that can be case to a datatime instance the represents the starting datetime
             of the model
+        tpl_subfolder (`str`): option to write template files to a subfolder within ``new_d``.
+            Default is False (write template files to ``new_d``).
+
+        chunk_len (`int`): the size of each "chunk" of files to spawn a multiprocessing.Pool member to process.
+            On windows, beware setting this much smaller than 50 because of the overhead associated with
+            spawning the pool.  This value is added to the call to `apply_list_and_array_pars`. Default is 50
+
+    Note:
+        This is the way...
+
+    Example::
+
+        pf = PstFrom("path_to_model_files","new_dir_with_pest_stuff",start_datetime="1-1-2020")
+        pf.add_parameters("hk.dat")
+        pf.add_observations("heads.csv")
+        pf.build_pst("pest.pst")
+        pe = pf.draw(100)
+        pe.to_csv("prior.csv")
 
     """
 
@@ -70,12 +89,17 @@ class PstFrom(object):
         spatial_reference=None,
         zero_based=True,
         start_datetime=None,
+        tpl_subfolder=None,
+        chunk_len=50,
     ):
 
-        self.original_d = original_d
-        self.new_d = new_d
+        self.original_d = Path(original_d)
+        self.new_d = Path(new_d)
         self.original_file_d = None
         self.mult_file_d = None
+        self.tpl_d = self.new_d
+        if tpl_subfolder is not None:
+            self.tpl_d = Path(self.new_d, tpl_subfolder)
         self.remove_existing = bool(remove_existing)
         self.zero_based = bool(zero_based)
         self._spatial_reference = spatial_reference
@@ -120,7 +144,8 @@ class PstFrom(object):
         self._prefix_count = {}
 
         self.get_xy = None
-
+        self.add_pars_callcount = 0
+        self.ijwarned = {}
         self.initialize_spatial_reference()
 
         self._setup_dirs()
@@ -131,9 +156,12 @@ class PstFrom(object):
         self.direct_org_files = []
         self.ult_ubound_fill = 1.0e30
         self.ult_lbound_fill = -1.0e30
+        self.chunk_len = int(chunk_len)
 
     @property
     def parfile_relations(self):
+        """build up a container of parameter file information.  Called
+        programmatically..."""
         if isinstance(self._parfile_relations, list):
             pr = pd.concat(self._parfile_relations, ignore_index=True)
         else:
@@ -220,8 +248,7 @@ class PstFrom(object):
             return (self._spatial_ref_xarray[i, j], self._spatial_ref_yarray[i, j])
 
     def parse_kij_args(self, args, kwargs):
-        """parse args into kij indices
-        """
+        """parse args into kij indices"""
         if len(args) >= 2:
             ij_id = None
             if "ij_id" in kwargs:
@@ -229,23 +256,33 @@ class PstFrom(object):
             if ij_id is not None:
                 i, j = [args[ij] for ij in ij_id]
             else:
+                if not self.ijwarned[self.add_pars_callcount]:
+                    self.logger.warn(
+                        (
+                            "get_xy() warning: position of i and j in index_cols "
+                            "not specified, assume (i,j) are final two entries in "
+                            "index_cols."
+                        )
+                    )
+                    self.ijwarned[self.add_pars_callcount] = True
                 # assume i and j are the final two entries in index_cols
                 i, j = args[-2], args[-1]
         else:
-            self.logger.warn(
-                (
-                    "get_xy() warning: need locational information "
-                    "(e.g. i,j) to generate xy, "
-                    "insufficient index cols passed to interpret: {}"
-                    ""
-                ).format(str(args))
-            )
+            if not self.ijwarned[self.add_pars_callcount]:
+                self.logger.warn(
+                    (
+                        "get_xy() warning: need locational information "
+                        "(e.g. i,j) to generate xy, "
+                        "insufficient index cols passed to interpret: {}"
+                        ""
+                    ).format(str(args))
+                )
+                self.ijwarned[self.add_pars_callcount] = True
             i, j = None, None
         return i, j
 
     def initialize_spatial_reference(self):
-        """process the spatial reference argument
-        """
+        """process the spatial reference argument.  Called programmatically"""
         if self._spatial_reference is None:
             self.get_xy = self._generic_get_xy
         elif hasattr(self._spatial_reference, "xcentergrid") and hasattr(
@@ -266,9 +303,7 @@ class PstFrom(object):
         self.spatial_reference = self._spatial_reference
 
     def write_forward_run(self):
-        """write the forward run script
-
-        """
+        """write the forward run script.  Called by build_pst()"""
         # update python commands with system style commands
         for alist, ilist in zip(
             [self.pre_py_cmds, self.mod_py_cmds, self.post_py_cmds],
@@ -291,7 +326,7 @@ class PstFrom(object):
                     self.logger.statement("forward_run line:{0}".format(new_sys_cmd))
                     alist.append(new_sys_cmd)
 
-        with open(os.path.join(self.new_d, self.py_run_file), "w") as f:
+        with open(self.new_d / self.py_run_file, "w") as f:
             f.write(
                 "import os\nimport multiprocessing as mp\nimport numpy as np"
                 + "\nimport pandas as pd\n"
@@ -311,10 +346,10 @@ class PstFrom(object):
             s = "    "
             for tmp_file in self.tmp_files:
                 f.write(s + "try:\n")
-                f.write(s + "   os.remove('{0}')\n".format(tmp_file))
+                f.write(s + "   os.remove(r'{0}')\n".format(tmp_file))
                 f.write(s + "except Exception as e:\n")
                 f.write(
-                    s + "   print('error removing tmp file:{0}')\n".format(tmp_file)
+                    s + "   print(r'error removing tmp file:{0}')\n".format(tmp_file)
                 )
             for line in self.pre_py_cmds:
                 f.write(s + line + "\n")
@@ -359,6 +394,11 @@ class PstFrom(object):
         Note:
             This method processes parameters by group names
 
+            For really large numbers of parameters (>30K), this method
+            will cause memory errors.  Luckily, in most cases, users
+            only want this matrix to generate a prior parameter ensemble
+            and the `PstFrom.draw()` is a better choice...
+
         """
         struct_dict = self._pivot_par_struct_dict()
         self.logger.log("building prior covariance matrix")
@@ -370,7 +410,7 @@ class PstFrom(object):
             cov = pyemu.Cov.from_parameter_data(self.pst, sigma_range=sigma_range)
 
         if filename is None:
-            filename = self.pst.filename.replace(".pst", ".prior.cov")
+            filename = self.pst.filename.with_suffix(".prior.cov")
         if fmt != "none":
             self.logger.statement(
                 "saving prior covariance matrix to file {0}".format(filename)
@@ -405,9 +445,14 @@ class PstFrom(object):
         Note:
             This method draws by parameter group
 
+            If you are using grid-style parameters, please use spectral simulation
+
 
         """
         self.logger.log("drawing realizations")
+        if self.pst.npar_adj == 0:
+            self.logger.warn("no adjustable parameters, nothing to draw...")
+            return
         # precondition {geostruct:{group:df}} dict to {geostruct:[par_dfs]}
         struct_dict = self._pivot_par_struct_dict()
         # list for holding grid style groups
@@ -424,7 +469,7 @@ class PstFrom(object):
             # (setup through add_parameters)
             for geostruct, par_df_l in struct_dict.items():
                 par_df = pd.concat(par_df_l)  # force to single df
-                if "i" in par_df.columns:  # need 'i' and 'j' for specsim
+                if "i" in par_df.columns and par_df.partype[0] == "grid":  # need 'i' and 'j' for specsim
                     # grid par slicer
                     grd_p = pd.notna(par_df.i)  # & (par_df.partype == 'grid') &
                 else:
@@ -497,7 +542,9 @@ class PstFrom(object):
                 components.
         Note:
             This builds a pest control file from scratch, overwriting anything already
-                in self.pst object and anything already writen to `filename`
+            in self.pst object and anything already writen to `filename`
+
+            The new pest control file is assigned an NOPTMAX value of 0
 
         """
 
@@ -512,12 +559,14 @@ class PstFrom(object):
                 update = False
             else:
                 if filename is None:
-                    filename = os.path.join(self.new_d, self.pst.filename)
+                    filename = get_filepath(self.new_d, self.pst.filename)
         else:
             if filename is None:
-                filename = os.path.join(self.new_d, self.original_d)
-        if os.path.dirname(filename) in ["", "."]:
-            filename = os.path.join(self.new_d, filename)
+                filename = Path(self.new_d, self.original_d.name).with_suffix(".pst")
+        filename = get_filepath(self.new_d, filename)
+
+        # if os.path.dirname(filename) in ["", "."]:
+        #    filename = os.path.join(self.new_d, filename)
 
         if update:
             pst = self.pst
@@ -539,24 +588,26 @@ class PstFrom(object):
                 par_data = pd.concat(self.par_dfs).loc[:, par_data_cols]
                 # info relating parameter multiplier files to model input files
                 parfile_relations = self.parfile_relations
-                parfile_relations.to_csv(
-                    os.path.join(self.new_d, "mult2model_info.csv")
-                )
+                parfile_relations.to_csv(self.new_d / "mult2model_info.csv")
                 if not any(
                     ["apply_list_and_array_pars" in s for s in self.pre_py_cmds]
                 ):
                     self.pre_py_cmds.insert(
                         0,
                         "pyemu.helpers.apply_list_and_array_pars("
-                        "arr_par_file='mult2model_info.csv')",
+                        "arr_par_file='mult2model_info.csv',chunk_len={0})".format(self.chunk_len),
                     )
             else:
                 par_data = pyemu.pst_utils._populate_dataframe(
                     [], pst.par_fieldnames, pst.par_defaults, pst.par_dtype
                 )
             pst.parameter_data = par_data
-            pst.template_files = self.tpl_filenames
-            pst.input_files = self.input_filenames
+            # pst.template_files = self.tpl_filenames
+            # pst.input_files = self.input_filenames
+            pst.model_input_data = pd.DataFrame(
+                {"pest_file": self.tpl_filenames, "model_file": self.input_filenames},
+                index=self.tpl_filenames,
+            )
 
         if "obs" in update.keys() or not uupdate:
             if len(self.obs_dfs) > 0:
@@ -569,13 +620,19 @@ class PstFrom(object):
                 obs_data.index = []
             obs_data.sort_index(inplace=True)
             pst.observation_data = obs_data
-            pst.instruction_files = self.ins_filenames
-            pst.output_files = self.output_filenames
+            # pst.instruction_files = self.ins_filenames
+            # pst.output_files = self.output_filenames
+            pst.model_output_data = pd.DataFrame(
+                {"pest_file": self.ins_filenames, "model_file": self.output_filenames},
+                index=self.ins_filenames,
+            )
         if not uupdate:
             pst.model_command = self.mod_command
 
         pst.prior_information = pst.null_prior
+        pst.control_data.noptmax = 0
         self.pst = pst
+
         self.pst.write(filename, version=version)
         self.write_forward_run()
         pst.try_parse_name_metadata()
@@ -589,7 +646,7 @@ class PstFrom(object):
             self.logger.lraise(
                 "original_d '{0}' is not a directory" "".format(self.original_d)
             )
-        if os.path.exists(self.new_d):
+        if self.new_d.exists():
             if self.remove_existing:
                 self.logger.log("removing existing new_d '{0}'" "".format(self.new_d))
                 shutil.rmtree(self.new_d)
@@ -612,19 +669,21 @@ class PstFrom(object):
             "".format(self.original_d, self.new_d)
         )
 
-        self.original_file_d = os.path.join(self.new_d, "org")
-        if os.path.exists(self.original_file_d):
+        self.original_file_d = self.new_d / "org"
+        if self.original_file_d.exists():
             self.logger.lraise(
                 "'org' subdir already exists in new_d '{0}'" "".format(self.new_d)
             )
-        os.makedirs(self.original_file_d)
+        self.original_file_d.mkdir(exist_ok=True)
 
-        self.mult_file_d = os.path.join(self.new_d, "mult")
-        if os.path.exists(self.mult_file_d):
+        self.mult_file_d = self.new_d / "mult"
+        if self.mult_file_d.exists():
             self.logger.lraise(
                 "'mult' subdir already exists in new_d '{0}'" "".format(self.new_d)
             )
-        os.makedirs(self.mult_file_d)
+        self.mult_file_d.mkdir(exist_ok=True)
+
+        self.tpl_d.mkdir(exist_ok=True)
 
         self.logger.log("setting up dirs")
 
@@ -655,12 +714,21 @@ class PstFrom(object):
         ) = self._prep_arg_list_lengths(
             filenames, fmts, seps, skip_rows, index_cols, use_cols
         )
+        storehead = None
         if index_cols is not None:
             for filename, sep, fmt, skip in zip(filenames, seps, fmts, skip_rows):
-                file_path = os.path.join(self.new_d, filename)
-                self.logger.log("loading list {0}".format(file_path))
+                # cast to pathlib.Path instance
+                # input file path may or may not include original_d
+                # input_filepath = get_filepath(self.original_d, filename)
+                rel_filepath = get_relative_filepath(self.original_d, filename)
+                dest_filepath = self.new_d / rel_filepath
+
+                # data file in dest_ws/org/ folder
+                org_file = self.original_file_d / rel_filepath.name
+
+                self.logger.log("loading list {0}".format(dest_filepath))
                 df, storehead = self._load_listtype_file(
-                    filename, index_cols, use_cols, fmt, sep, skip, c_char
+                    rel_filepath, index_cols, use_cols, fmt, sep, skip, c_char
                 )
                 # Currently just passing through comments in header (i.e. before the table data)
                 stkeys = np.array(
@@ -674,7 +742,7 @@ class PstFrom(object):
                 if fmt.lower() == "free":
                     if sep is None:
                         sep = " "
-                        if filename.lower().endswith(".csv"):
+                        if rel_filepath.suffix.lower() == ".csv":
                             sep = ","
                 if df.columns.is_integer():
                     hheader = False
@@ -682,7 +750,7 @@ class PstFrom(object):
                     hheader = df.columns
 
                 self.logger.statement(
-                    "loaded list '{0}' of shape {1}" "".format(file_path, df.shape)
+                    "loaded list '{0}' of shape {1}" "".format(dest_filepath, df.shape)
                 )
                 # TODO BH: do we need to be careful of the format of the model
                 #  files? -- probs not necessary for the version in
@@ -694,11 +762,15 @@ class PstFrom(object):
                 # input file format (and sep), right?
                 # write orig version of input file to `org` (e.g.) dir
 
+                # make any subfolders if they don't exist
+                # org_path = Path(self.original_file_d, rel_file_path.parent)
+                # org_path.mkdir(exist_ok=True)
+
                 if len(storehead) != 0:
                     kwargs = {}
                     if "win" in platform.platform().lower():
                         kwargs = {"line_terminator": "\n"}
-                    with open(os.path.join(self.original_file_d, filename), "w") as fp:
+                    with open(org_file, "w") as fp:
                         lc = 0
                         fr = 0
                         for key in sorted(storehead.keys()):
@@ -735,16 +807,16 @@ class PstFrom(object):
                             )
                 else:
                     df.to_csv(
-                        os.path.join(self.original_file_d, filename),
+                        org_file,
                         index=False,
                         sep=",",
                         header=hheader,
                     )
-                file_dict[filename] = df
-                fmt_dict[filename] = fmt
-                sep_dict[filename] = sep
-                skip_dict[filename] = skip
-                self.logger.log("loading list {0}".format(file_path))
+                file_dict[rel_filepath] = df
+                fmt_dict[rel_filepath] = fmt
+                sep_dict[rel_filepath] = sep
+                skip_dict[rel_filepath] = skip
+                self.logger.log("loading list {0}".format(dest_filepath))
 
             # check for compatibility
             fnames = list(file_dict.keys())
@@ -762,9 +834,13 @@ class PstFrom(object):
                         )
         else:  # load array type files
             # loop over model input files
-            for filename, sep, fmt, skip in zip(filenames, seps, fmts, skip_rows):
+            for input_filena, sep, fmt, skip in zip(filenames, seps, fmts, skip_rows):
+                # cast to pathlib.Path instance
+                # input file path may or may not include original_d
+                input_filena = get_filepath(self.original_d, input_filena)
                 if fmt.lower() == "free":
-                    if filename.lower().endswith(".csv"):
+                    # cast to string to work with pathlib objects
+                    if input_filena.suffix.lower() == ".csv":
                         if sep is None:
                             sep = ","
                 else:
@@ -772,24 +848,27 @@ class PstFrom(object):
                     raise NotImplementedError(
                         "Only free format array " "par files currently supported"
                     )
-                file_path = os.path.join(self.new_d, filename)
-                self.logger.log("loading array {0}".format(file_path))
-                if not os.path.exists(file_path):
+                # file path relative to model workspace
+                rel_filepath = input_filena.relative_to(self.original_d)
+                dest_filepath = self.new_d / rel_filepath
+                self.logger.log("loading array {0}".format(dest_filepath))
+                if not dest_filepath.exists():
                     self.logger.lraise(
-                        "par filename '{0}' not found ".format(file_path)
+                        "par filename '{0}' not found ".format(dest_filepath)
                     )
                 # read array type input file
-                arr = np.loadtxt(os.path.join(self.new_d, filename), delimiter=sep)
-                self.logger.log("loading array {0}".format(file_path))
+                arr = np.loadtxt(dest_filepath, delimiter=sep, ndmin=2)
+                self.logger.log("loading array {0}".format(dest_filepath))
                 self.logger.statement(
-                    "loaded array '{0}' of shape {1}".format(filename, arr.shape)
+                    "loaded array '{0}' of shape {1}".format(input_filena, arr.shape)
                 )
                 # save copy of input file to `org` dir
-                np.savetxt(os.path.join(self.original_file_d, filename), arr)
-                file_dict[filename] = arr
-                fmt_dict[filename] = fmt
-                sep_dict[filename] = sep
-                skip_dict[filename] = skip
+                # make any subfolders if they don't exist
+                np.savetxt(self.original_file_d / rel_filepath.name, arr)
+                file_dict[rel_filepath] = arr
+                fmt_dict[rel_filepath] = fmt
+                sep_dict[rel_filepath] = sep
+                skip_dict[rel_filepath] = skip
             # check for compatibility
             fnames = list(file_dict.keys())
             for i in range(len(fnames)):
@@ -805,7 +884,15 @@ class PstFrom(object):
                                 file_dict[fnames[j]].shape,
                             )
                         )
-        return index_cols, use_cols, file_dict, fmt_dict, sep_dict, skip_dict
+        return (
+            index_cols,
+            use_cols,
+            file_dict,
+            fmt_dict,
+            sep_dict,
+            skip_dict,
+            storehead,
+        )
 
     def _next_count(self, prefix):
         if prefix not in self._prefix_count:
@@ -815,56 +902,77 @@ class PstFrom(object):
 
         return self._prefix_count[prefix]
 
-    def add_py_function(self, file_name, function_name, is_pre_cmd=True):
+    def add_py_function(
+        self, file_name, call_str=None, is_pre_cmd=True, function_name=None
+    ):
         """add a python function to the forward run script
 
         Args:
             file_name (`str`): a python source file
-            function_name (`str`): a python function in
-                `file_name`
-            is_pre_cmd (`bool`): flag to include `function_name` in
-                PstFrom.pre_py_cmds.  If False, `function_name` is
+            call_str (`str`): the call string for python function in
+                `file_name`.
+                `call_str` will be added to the forward run script, as is.
+            is_pre_cmd (`bool`): flag to include `call_str` in
+                PstFrom.pre_py_cmds.  If False, `call_str` is
                 added to PstFrom.post_py_cmds instead. If passed as `None`,
-                then the function `function_name` is added to the forward run
+                then the function `call_str` is added to the forward run
                 script but is not called.  Default is True.
+            function_name (`str`): DEPRECATED, used `call_str`
         Returns:
             None
 
         Note:
-            `function_name` is expected to be standalone a function
-                that contains all the imports it needs or these imports
-                should have been added to the forward run script through the
-                `PstFrom.py_imports` list.
-            This function adds the `function_name` call to the forward
-                run script (either as a pre or post command). It is up to users
-                 to make sure `function_name` is a valid python function call
-                  that includes the parentheses and requisite arguments
-            This function expects "def " + `function_name` to be flushed left at the outer
-                most indentation level
+            `call_str` is expected to reference standalone a function
+            that contains all the imports it needs or these imports
+            should have been added to the forward run script through the
+            `PstFrom.py_imports` list.
+
+            This function adds the `call_str` call to the forward
+            run script (either as a pre or post command). It is up to users
+            to make sure `call_str` is a valid python function call
+            that includes the parentheses and requisite arguments
+
+            This function expects "def " + `function_name` to be flushed left
+            at the outer most indentation level
 
         Example::
 
             pf = PstFrom()
-            pf.add_py_function("preprocess.py","mult_well_function()",is_pre_cmd=True)
+            pf.add_py_function(
+                "preprocess.py",
+                "mult_well_function(arg1='userarg')",
+                is_pre_cmd = True
+                )
 
 
         """
-
+        if function_name is not None:
+            warnings.warn(
+                "add_py_function(): 'function_name' argument is deprecated, "
+                "use 'call_str' instead",
+                DeprecationWarning,
+            )
+            if call_str is None:
+                call_str = function_name
+        if call_str is None:
+            self.logger.lraise(
+                "add_py_function(): No function call string passed in arg " "'call_str'"
+            )
         if not os.path.exists(file_name):
             self.logger.lraise(
                 "add_py_function(): couldnt find python source file '{0}'".format(
                     file_name
                 )
             )
-        if "(" not in function_name or ")" not in function_name:
+        if "(" not in call_str or ")" not in call_str:
             self.logger.lraise(
-                "add_py_function(): function_name '{0}' missing paretheses".format(
-                    function_name
-                )
+                "add_py_function(): call_str '{0}' missing paretheses".format(call_str)
             )
-
+        function_name = call_str[
+            : call_str.find("(")
+        ]  # strip to first occurance of '('
         func_lines = []
-        search_str = "def " + function_name
+        search_str = "def " + function_name + "("
         abet_set = set(string.ascii_uppercase)
         abet_set.update(set(string.ascii_lowercase))
         with open(file_name, "r") as f:
@@ -891,15 +999,102 @@ class PstFrom(object):
 
         self._function_lines_list.append(func_lines)
         if is_pre_cmd is True:
-            self.pre_py_cmds.append(function_name)
+            self.pre_py_cmds.append(call_str)
         elif is_pre_cmd is False:
-            self.post_py_cmds.append(function_name)
+            self.post_py_cmds.append(call_str)
         else:
             self.logger.warn(
                 "add_py_function() command: {0} is not being called directly".format(
-                    function_name
+                    call_str
                 )
             )
+
+    def _process_array_obs(self,out_filename,ins_filename,prefix,ofile_sep,ofile_skip,longnames,zone_array):
+        """private method to setup observations for an array-style file
+
+        Args:
+            out_filename (`str`): the output array file
+            ins_filename (`str`): the instruction file to create
+            prefix (`str`): the prefix to add to the observation names and also to use as the
+                observation group name.
+            ofile_sep (`str`): the separator in the output file.  This is currently just a
+                placeholder arg, only whitespace-delimited files are supported
+            ofile_skip (`int`): number of header and/or comment lines to skip at the
+                top of the output file
+            longnames (`bool`): flag to allow longer observations names
+            zone_array (numpy.ndarray): an integer array used to identify positions to skip in the
+                output array
+
+        Returns:
+            None
+
+        Note:
+
+            This method is called programmatically by `PstFrom.add_observations()`
+
+        """
+        if ofile_sep is not None:
+            self.logger.lrase("array obs are currently only supported for whitespace delim")
+        if not os.path.exists(self.new_d / out_filename):
+            self.logger.lraise("array obs output file '{0}' not found".format(out_filename))
+        if len(prefix) == 0 and self.longnames:
+            prefix = out_filename
+        f_out = open(self.new_d/out_filename,'r')
+        f_ins = open(self.new_d/ins_filename,'w')
+        f_ins.write("pif ~\n")
+        iline = 0
+        if ofile_skip is not None:
+            ofile_skip = int(ofile_skip)
+            f_ins.write("l{0}\n".format(ofile_skip))
+            # read the output file forward
+            for _ in range(ofile_skip):
+                f_out.readline()
+                iline += 1
+        onames,ovals = [],[]
+        iidx = 0
+        for line in f_out:
+            raw = line.split()
+            f_ins.write("l1 ")
+            for jr,r in enumerate(raw):
+
+                try:
+                    fr = float(r)
+                except Exception as e:
+                    self.logger.lraise("array obs error casting: '{0}' on line {1} to a float: {2}".\
+                                       format(r,iline,str(e)))
+
+                zval = None
+                if zone_array is not None:
+                    try:
+                        zval = zone_array[iidx, jr]
+                    except Exception as e:
+                        self.logger.lraise("array obs error getting zone value for i,j {0},{1} in line {2}: {3}". \
+                                           format(iidx, jr, iline, str(e)))
+                    if zval <= 0:
+                        f_ins.write(" !dum! ")
+                        if jr < len(raw) - 1:
+                            f_ins.write(" w ")
+                        continue
+
+                if longnames:
+                    oname = "arrobs_{0}_i:{1}_j:{2}".format(prefix,iidx,jr)
+                    if zval is not None:
+                        oname += "_zone:{0}".format(zval)
+                else:
+                    oname = "{0}_{1}_{2}".format(prefix,iidx,jr)
+                    if zval is not None:
+                        z_str = "_{0}".format(zval)
+                        if len(oname) + len(z_str) < 20:
+                            oname += z_str
+                    if len(oname) > 20:
+                        self.logger.lraise("array obs name too long: '{0}'".format(oname))
+                f_ins.write(" !{0}! ".format(oname))
+                if jr < len(raw) - 1:
+                    f_ins.write(" w ")
+            f_ins.write("\n")
+            iline += 1
+            iidx += 1
+
 
     def add_observations(
         self,
@@ -913,12 +1108,14 @@ class PstFrom(object):
         ofile_sep=None,
         rebuild_pst=False,
         obsgp=True,
+        zone_array=None,
+        includes_header=True,
     ):
         """
-        Add list style outputs as observation files to PstFrom object
+        Add values in output files as observations to PstFrom object
 
         Args:
-            filename (`str`): path to model output file name to set up
+            filename (`str`): model output file name(s) to set up
                 as observations
             insfile (`str`): desired instructions file filename
             index_cols (`list`-like or `int`): columns to denote are indices for obs
@@ -929,9 +1126,36 @@ class PstFrom(object):
             ofile_sep (`str`): delimiter in output file
             rebuild_pst (`bool`): (Re)Construct PstFrom.pst object after adding
                 new obs
+            zone_array (`np.ndarray`): array defining spatial limits or zones
+                for array-style observations. Default is None
+            includes_header (`bool`): flag indicating that the list file includes a
+                header row.  Default is True.
 
         Returns:
             `Pandas.DataFrame`: dataframe with info for new observations
+
+        Note:
+            This is the main entry for adding observations to the pest interface
+
+            If `index_cols` and `use_cols` are both None, then it is assumed that
+            array-style observations are being requested.  In this case,
+            `filenames` must be only one filename.
+
+            `zone_array` is only used for array-style observations.  Zone values
+            less than or equal to zero are skipped (using the "dum" option)
+
+
+        Example::
+
+            # setup observations for the 2nd thru 5th columns of the csv file
+            # using the first column as the index
+            df = pf.add_observations("heads.csv",index_col=0,use_cols=[1,2,3,4],
+                                     ofile_sep=",")
+            # add array-style observations, skipping model cells with an ibound
+            # value less than or equal to zero
+            df = pf.add_observations("conce_array.day",index_col=None,use_cols=None,
+                                     zone_array=ibound)
+
 
         """
         # TODO - array style outputs? or expecting post processing to tabular
@@ -954,7 +1178,34 @@ class PstFrom(object):
             seps=ofile_sep,
             skip_rows=ofile_skip,
         )
-        # load model output file
+        # array style obs
+        if index_cols is None and use_cols is None:
+            if not isinstance(filenames,str):
+                if len(filenames) > 1:
+                    self.logger.lraise("only a single filename can be used for array-style observations")
+                filenames = filenames[0]
+            self.logger.log("adding observations from array output file '{0}'".format(filenames))
+            df_obs = self._process_array_obs(filenames,insfile,prefix,ofile_sep,ofile_skip,self.longnames,zone_array)
+            new_obs = self.add_observations_from_ins(
+                ins_file=insfile, out_file=self.new_d / filename
+            )
+            if obsgp is not None:
+                new_obs.loc[:, "obgnme"] = obsgp
+            elif prefix is not None:
+                new_obs.loc[:, "obgnme"] = prefix
+            self.logger.log("adding observations from array output file '{0}'".format(filenames))
+            if rebuild_pst:
+                if self.pst is not None:
+                    self.logger.log("Adding obs to control file " "and rewriting pst")
+                    self.build_pst(filename=self.pst.filename, update="obs")
+                else:
+                    self.build_pst(filename=self.pst.filename, update=False)
+                    self.logger.warn(
+                        "pst object not available, " "new control file will be written"
+                    )
+            return new_obs
+
+        # list style obs
         df, storehead = self._load_listtype_file(
             filenames, index_cols, use_cols, fmts, seps, skip_rows
         )
@@ -999,14 +1250,14 @@ class PstFrom(object):
             obsgp = _check_var_len(obsgp, ncol, fill=True)
             df_ins = pyemu.pst_utils.csv_to_ins_file(
                 df.set_index("idx_str"),
-                ins_filename=os.path.join(self.new_d, insfile),
+                ins_filename=self.new_d / insfile,
                 only_cols=use_cols,
                 only_rows=use_rows,
                 marker="~",
-                includes_header=True,
+                includes_header=includes_header,
                 includes_index=False,
                 prefix=prefix,
-                longnames=True,
+                longnames=self.longnames,
                 head_lines_len=lenhead,
                 sep=sep,
                 gpname=obsgp,
@@ -1015,7 +1266,7 @@ class PstFrom(object):
                 "building insfile for tabular output file {0}" "".format(filename)
             )
             new_obs = self.add_observations_from_ins(
-                ins_file=insfile, out_file=os.path.join(self.new_d, filename)
+                ins_file=insfile, out_file=self.new_d / filename
             )
             if "obgnme" in df_ins.columns:
                 new_obs.loc[:, "obgnme"] = df_ins.loc[new_obs.index, "obgnme"]
@@ -1036,48 +1287,48 @@ class PstFrom(object):
     def add_observations_from_ins(
         self, ins_file, out_file=None, pst_path=None, inschek=True
     ):
-        """ add new observations to a control file
+        """add new observations to a control file from an existing instruction file
 
-         Args:
-             ins_file (`str`): instruction file with exclusively new
-                observation names
-             out_file (`str`): model output file.  If None, then 
-                ins_file.replace(".ins","") is used. Default is None
-             pst_path (`str`): the path to append to the instruction file and 
-                out file in the control file.  If not None, then any existing 
-                path in front of the template or in file is split off and 
-                pst_path is prepended.  If python is being run in a directory 
-                other than where the control file will reside, it is useful 
-                to pass `pst_path` as `.`. Default is None
-             inschek (`bool`): flag to try to process the existing output file 
-                using the `pyemu.InstructionFile` class.  If successful, 
-                processed outputs are used as obsvals
+        Args:
+            ins_file (`str`): instruction file with exclusively new
+               observation names
+            out_file (`str`): model output file.  If None, then
+               ins_file.replace(".ins","") is used. Default is None
+            pst_path (`str`): the path to append to the instruction file and
+               out file in the control file.  If not None, then any existing
+               path in front of the template or in file is split off and
+               pst_path is prepended.  If python is being run in a directory
+               other than where the control file will reside, it is useful
+               to pass `pst_path` as `.`. Default is None
+            inschek (`bool`): flag to try to process the existing output file
+               using the `pyemu.InstructionFile` class.  If successful,
+               processed outputs are used as obsvals
 
-         Returns:
-             `pandas.DataFrame`: the data for the new observations that were 
-                added
+        Returns:
+            `pandas.DataFrame`: the data for the new observations that were
+               added
 
-         Note:
-             populates the new observation information with default values
+        Note:
+            populates the new observation information with default values
 
-         Example::
+        Example::
 
-             pst = pyemu.Pst(os.path.join("template", "my.pst"))
-             pst.add_observations(os.path.join("template","new_obs.dat.ins"), 
-                                  pst_path=".")
-             pst.write(os.path.join("template", "my_new.pst")
+            pst = pyemu.Pst(os.path.join("template", "my.pst"))
+            pst.add_observations_from_ins(os.path.join("template","new_obs.dat.ins"),
+                                 pst_path=".")
+            pst.write(os.path.join("template", "my_new.pst")
 
-         """
+        """
         # lifted almost completely from `Pst().add_observation()`
         if os.path.dirname(ins_file) in ["", "."]:
-            ins_file = os.path.join(self.new_d, ins_file)
+            ins_file = self.new_d / ins_file
             pst_path = "."
         if not os.path.exists(ins_file):
             self.logger.lraise(
                 "ins file not found: {0}, {1}" "".format(os.getcwd(), ins_file)
             )
         if out_file is None:
-            out_file = ins_file.replace(".ins", "")
+            out_file = str(ins_file).replace(".ins", "")
         if ins_file == out_file:
             self.logger.lraise("ins_file == out_file, doh!")
 
@@ -1174,7 +1425,8 @@ class PstFrom(object):
     ):
         """
         Add list or array style model input files to PstFrom object.
-        This method
+        This method is the main entry point for adding parameters to the
+        pest interface
 
         Args:
             filenames (`str`): Model input filenames to parameterize
@@ -1189,14 +1441,20 @@ class PstFrom(object):
             sigma_range: not yet implemented # TODO
             upper_bound (`float`): PEST parameter upper bound # TODO support different ubound,lbound,transform if multiple use_col
             lower_bound (`float`): PEST parameter lower bound
-            transform (`str`): PEST parameter transformation
+            transform (`str`): PEST parameter transformation.  Must be either "log","none" or "fixed.  The "tied" transform
+                must be used after calling `PstFrom.build_pst()`.
             par_name_base (`str`): basename for parameters that are set up
             index_cols (`list`-like): if not None, will attempt to parameterize
                 expecting a tabular-style model input file. `index_cols`
-                defines the unique columns used to set up pars.
-                May be passed as a dictionary using the keys `i` and `j`
-                to allow columns that relate to model rows and columns to be
-                identified and processed to x,y.
+                defines the unique columns used to set up pars. If passed as a
+                list of `str`, stings are expected to denote the columns
+                headers in tabular-style parameter files; if `i` and `j` in
+                list, these columns will be used to define spatial position for
+                spatial correlations (if required). WARNING: If passed as list
+                of `int`, `i` and `j` will be assumed to be in last two entries
+                in the list. Can be passed as a dictionary using the keys
+                `i` and `j` to explicitly speficy the columns that relate to
+                model rows and columns to be identified and processed to x,y.
             use_cols (`list`-like or `int`): for tabular-style model input file,
                 defines the columns to be parameterised
             pargp (`str`): Parameter group to assign pars to. This is PESTs
@@ -1237,12 +1495,25 @@ class PstFrom(object):
                 Warning: currently comment lines within list-like tabular data
                 will be lost.
             par_style (`str`): either "multiplier" or "direct" where the former setups
-                up a multiplier parameter process against the exsting model input
+                up a multiplier parameter process against the existing model input
                 array and the former setups a template file to write the model
                 input file directly.  Default is "multiplier".
 
         Returns:
             `pandas.DataFrame`: dataframe with info for new parameters
+
+        Example::
+
+            # setup grid-scale direct parameters for an array of numbers
+            df = pf.add_parameters("hk.dat",par_type="grid",par_style="direct")
+            # setup pilot point multiplier parameters for an array of numbers
+            # with a pilot point being set in every 5th active model cell
+            df = pf.add_parameters("recharge.dat",par_type="pilotpoint",pp_space=5,
+                                   zone_array="ibound.dat")
+            # setup a single multiplier parameter for the 4th column
+            # of a column format (list type) file
+            df = pf.add_parameters("wel_list_1.dat",par_type="constant",
+                                   index_cols=[0,1,2],use_cols=[3])
 
         """
         # TODO need more support for temporal pars?
@@ -1250,12 +1521,19 @@ class PstFrom(object):
 
         # TODO support passing par_file (i,j)/(x,y) directly where information
         #  is not contained in model parameter file - e.g. no i,j columns
-
+        self.add_pars_callcount += 1
+        self.ijwarned[self.add_pars_callcount] = False
         # this keeps denormal values for creeping into the model input arrays
         if ult_ubound is None:
             ult_ubound = self.ult_ubound_fill
         if ult_lbound is None:
             ult_lbound = self.ult_lbound_fill
+
+        if transform.lower().strip() not in ["none","log","fixed"]:
+            self.logger.lraise("unrecognized transform ('{0}'), should be in ['none','log','fixed']".format(transform))
+
+        if transform == "fixed" and geostruct is not None:
+            self.logger.lraise("geostruct is not 'None', cant draw values for fixed pars")
 
         # some checks for direct parameters
         par_style = par_style.lower()
@@ -1265,8 +1543,14 @@ class PstFrom(object):
                     par_style
                 )
             )
-        if isinstance(filenames, str):
+        if isinstance(filenames, str) or isinstance(filenames, Path):
             filenames = [filenames]
+        # data file paths relative to the model_ws
+        filenames = [
+            get_relative_filepath(self.original_d, filename) for filename in filenames
+        ]
+        if len(filenames) == 0:
+            self.logger.lraise("add_parameters(): filenames is empty")
         if par_style == "direct":
             if len(filenames) != 1:
                 self.logger.lraise(
@@ -1280,17 +1564,19 @@ class PstFrom(object):
                     )
                     + " already used for 'direct' parameterization"
                 )
+            else:
+                self.direct_org_files.append(filenames[0])
         # Default par data columns used for pst
         par_data_cols = pyemu.pst_utils.pst_config["par_fieldnames"]
         self.logger.log(
             "adding {0} type {1} style parameters for file(s) {2}".format(
-                par_type, par_style, str(filenames)
+                par_type, par_style, [str(f) for f in filenames]
             )
         )
         if geostruct is not None:
-            if geostruct.sill != 1.0 and par_style != "multiplier":
+            if geostruct.sill != 1.0:  #  and par_style != "multiplier": #TODO !=?
                 self.logger.warn(
-                    "geostruct sill != 1.0 for 'multiplier' style parameters"
+                    "geostruct sill != 1.0"  # for 'multiplier' style parameters"
                 )
             if geostruct.transform != transform:
                 self.logger.warn(
@@ -1342,6 +1628,7 @@ class PstFrom(object):
             fmt_dict,
             sep_dict,
             skip_dict,
+            headerlines,  # needed for direct pars (need to be in tpl)
         ) = self._par_prep(
             filenames,
             idx_cols,
@@ -1412,19 +1699,19 @@ class PstFrom(object):
         if par_style == "multiplier":
             mlt_filename = "{0}_{1}.csv".format(par_name_store, par_type)
             # pst input file (for tpl->in pair) is multfile (in mult dir)
-            in_filepst = os.path.relpath(
-                os.path.join(self.mult_file_d, mlt_filename), self.new_d
-            )
-            tpl_filename = mlt_filename + ".tpl"
-            in_fileabs = os.path.join(self.mult_file_d, mlt_filename)
+            in_fileabs = self.mult_file_d / mlt_filename
+            # pst input file (for tpl->in pair) is multfile (in mult dir)
+            in_filepst = in_fileabs.relative_to(self.new_d)
+            tpl_filename = self.tpl_d / (mlt_filename + ".tpl")
         else:
             mlt_filename = np.NaN
-            # pst input file (for tpl->in pair) is multfile (in mult dir)
-            in_filepst = os.path.relpath(
-                os.path.join(self.original_file_d, filenames[0]), self.new_d
-            )
-            tpl_filename = filenames[0] + ".tpl"
-            in_fileabs = os.path.join(self.new_d, in_filepst)
+            # absolute path to org/datafile
+            in_fileabs = self.original_file_d / filenames[0].name
+            # pst input file (for tpl->in pair) is orgfile (in org dir)
+            # relative path to org/datafile (relative to dest model workspace):
+            in_filepst = in_fileabs.relative_to(self.new_d)
+            tpl_filename = self.tpl_d / (filenames[0].name + ".tpl")
+
         pp_filename = None  # setup placeholder variables
         fac_filename = None
 
@@ -1449,12 +1736,18 @@ class PstFrom(object):
                 "writing list-based template file '{0}'".format(tpl_filename)
             )
             # Generate tabular type template - also returns par data
-            dfs = [file_dict[filename] for filename in filenames]
+            # relative file paths are in file_dict as Path instances (kludgey)
+            dfs = [file_dict[Path(filename)] for filename in filenames]
+            get_xy = None
+            if (
+                par_type.startswith("grid") or par_type.startswith("p")
+            ) and geostruct is not None:
+                get_xy = self.get_xy
             df = write_list_tpl(
                 filenames,
                 dfs,
                 par_name_base,
-                tpl_filename=os.path.join(self.new_d, tpl_filename),
+                tpl_filename=tpl_filename,
                 par_type=par_type,
                 suffix="",
                 index_cols=index_cols,
@@ -1464,14 +1757,16 @@ class PstFrom(object):
                 longnames=self.longnames,
                 ij_in_idx=ij_in_idx,
                 xy_in_idx=xy_in_idx,
-                get_xy=self.get_xy,
+                get_xy=get_xy,
                 zero_based=self.zero_based,
                 input_filename=in_fileabs,
                 par_style=par_style,
+                headerlines=headerlines,  # only needed for direct pars
             )
-            assert np.mod(len(df), len(use_cols)) == 0.0, (
-                "Parameter dataframe wrong shape for number of cols {0}"
-                "".format(use_cols)
+            assert (
+                np.mod(len(df), len(use_cols)) == 0.0
+            ), "Parameter dataframe wrong shape for number of cols {0}" "".format(
+                use_cols
             )
             # variables need to be passed to each row in df
             lower_bound = np.tile(lower_bound, int(len(df) / ncol))
@@ -1493,7 +1788,7 @@ class PstFrom(object):
                 # Generate array type template - also returns par data
                 df = write_array_tpl(
                     name=par_name_base[0],
-                    tpl_filename=os.path.join(self.new_d, tpl_filename),
+                    tpl_filename=tpl_filename,
                     suffix="",
                     par_type=par_type,
                     zone_array=zone_array,
@@ -1565,7 +1860,8 @@ class PstFrom(object):
                 # pst inputfile (for tpl->in pair) is
                 # par_name_storepp.dat table (in pst ws)
                 in_filepst = pp_filename
-                tpl_filename = pp_filename + ".tpl"
+                tpl_filename = self.tpl_d / (pp_filename + ".tpl")
+                # tpl_filename = get_relative_filepath(self.new_d, tpl_filename)
                 if pp_space is None:  # default spacing if not passed
                     self.logger.warn("pp_space is None, using 10...\n")
                     pp_space = 10
@@ -1619,10 +1915,8 @@ class PstFrom(object):
                     prefix_dict=pp_dict,
                     every_n_cell=pp_space,
                     pp_dir=self.new_d,
-                    tpl_dir=self.new_d,
-                    shapename=os.path.join(
-                        self.new_d, "{0}.shp".format(par_name_store)
-                    ),
+                    tpl_dir=self.tpl_d,
+                    shapename=str(self.new_d / "{0}.shp".format(par_name_store)),
                     longnames=self.longnames,
                 )
                 df.set_index("parnme", drop=False, inplace=True)
@@ -1645,7 +1939,7 @@ class PstFrom(object):
                 pp_info_dict = {
                     "pp_data": ok_pp.point_data.loc[:, ["x", "y", "zone"]],
                     "cov": ok_pp.point_cov_df,
-                    "zn_ar": zone_array,
+                    "zn_ar": zone_array
                 }
                 fac_processed = False
                 for facfile, info in self._pp_facs.items():  # check against
@@ -1661,10 +1955,8 @@ class PstFrom(object):
                 if not fac_processed:
                     # TODO need better way of naming squential fac_files?
                     self.logger.log("calculating factors for pargp={0}".format(pg))
-                    fac_filename = os.path.join(
-                        self.new_d, "{0}pp.fac".format(par_name_store)
-                    )
-                    var_filename = fac_filename.replace(".fac", ".var.dat")
+                    fac_filename = self.new_d / "{0}pp.fac".format(par_name_store)
+                    var_filename = fac_filename.with_suffix(".var.dat")
                     self.logger.statement(
                         "saving krige variance file:{0}".format(var_filename)
                     )
@@ -1705,12 +1997,18 @@ class PstFrom(object):
         # eventually filled by PEST) to actual model files so that actual
         # model input file can be generated
         # (using helpers.apply_list_and_array_pars())
+        zone_filename = None
+        if zone_array is not None and zone_array.ndim < 3:
+            #zone_filename = tpl_filename.replace(".tpl",".zone")
+            zone_filename = Path(str(tpl_filename).replace(".tpl", ".zone"))
+            self.logger.statement("saving zone array {0} for tpl file {1}".format(zone_filename,tpl_filename))
+            np.savetxt(zone_filename,zone_array,fmt="%4d")
+            zone_filename = zone_filename.name
+
         relate_parfiles = []
         for mod_file in file_dict.keys():
             mult_dict = {
-                "org_file": os.path.join(
-                    *os.path.split(self.original_file_d)[1:], mod_file
-                ),
+                "org_file": Path(self.original_file_d.name, mod_file.name),
                 "model_file": mod_file,
                 "use_cols": use_cols,
                 "index_cols": index_cols,
@@ -1721,15 +2019,18 @@ class PstFrom(object):
                 "lower_bound": ult_lbound,
             }
             if par_style == "multiplier":
-                mult_dict["mlt_file"] = os.path.join(
-                    *os.path.split(self.mult_file_d)[1:], mlt_filename
-                )
+                mult_dict["mlt_file"] = Path(self.mult_file_d.name, mlt_filename)
 
             if pp_filename is not None:
                 # if pilotpoint need to store more info
                 assert fac_filename is not None, "missing pilot-point input filename"
                 mult_dict["fac_file"] = os.path.relpath(fac_filename, self.new_d)
                 mult_dict["pp_file"] = pp_filename
+                mult_dict["pp_fill_value"] = 1.0
+                mult_dict["pp_lower_limit"] = 1.0e-10
+                mult_dict["pp_upper_limit"] = 1.0e+10
+            if zone_filename is not None:
+                mult_dict["zone_file"] = zone_filename
             relate_parfiles.append(mult_dict)
         relate_pars_df = pd.DataFrame(relate_parfiles)
         # store on self for use in pest build etc
@@ -1743,7 +2044,7 @@ class PstFrom(object):
         # df.loc[:,"tpl_filename"] = tpl_filename
 
         # store tpl --> in filename pair
-        self.tpl_filenames.append(tpl_filename)
+        self.tpl_filenames.append(get_relative_filepath(self.new_d, tpl_filename))
         self.input_filenames.append(in_filepst)
         for file_name in file_dict.keys():
             # store mult --> original file pairs
@@ -1755,7 +2056,7 @@ class PstFrom(object):
         missing = set(par_data_cols) - set(df.columns)
         for field in missing:  # fill missing pst.parameter_data cols with defaults
             df[field] = pyemu.pst_utils.pst_config["par_defaults"][field]
-        df = df.drop_duplicates()  # drop pars that appear multiple times
+        df = df.drop_duplicates(subset="parnme")  # drop pars that appear multiple times
         # df = df.loc[:, par_data_cols]  # just storing pst required cols
         # - need to store more for cov builder (e.g. x,y)
         # TODO - check when self.par_dfs gets used
@@ -1817,8 +2118,9 @@ class PstFrom(object):
             #     variograms=v)
 
         self.logger.log(
-            "adding {0} type {1} style parameters for file(s) {2}"
-            "".format(par_type, par_style, str(filenames))
+            "adding {0} type {1} style parameters for file(s) {2}".format(
+                par_type, par_style, [str(f) for f in filenames]
+            )
         )
 
         if rebuild_pst:  # may want to just update pst and rebuild
@@ -1878,14 +2180,14 @@ class PstFrom(object):
                 "use_cols also listed in " "index_cols: {0}".format(str(i))
             )
 
-        file_path = os.path.join(self.new_d, filename)
+        file_path = self.new_d / filename
         if not os.path.exists(file_path):
             self.logger.lraise("par filename '{0}' not found " "".format(file_path))
         self.logger.log("reading list {0}".format(file_path))
         if fmt.lower() == "free":
             if sep is None:
                 sep = "\s+"
-                if filename.lower().endswith(".csv"):
+                if Path(filename).suffix == ".csv":
                     sep = ","
         else:
             # TODO support reading fixed-format
@@ -2055,8 +2357,9 @@ def write_list_tpl(
     zero_based=True,
     input_filename=None,
     par_style="multiplier",
+    headerlines=None,
 ):
-    """ Write template files for a list style input.
+    """Write template files for a list style input.
 
     Args:
         filenames (`str` of `container` of `str`): original input filenames
@@ -2098,6 +2401,9 @@ def write_list_tpl(
     Returns:
         `pandas.DataFrame`: dataframe with info for the new parameters
 
+    Note:
+        This function is called by `PstFrom` programmatically
+
     """
     # get dataframe with autogenerated parnames based on `name`, `index_cols`,
     # `use_cols`, `suffix` and `par_type`
@@ -2118,6 +2424,7 @@ def write_list_tpl(
             ij_in_idx=ij_in_idx,
             xy_in_idx=xy_in_idx,
             zero_based=zero_based,
+            headerlines=headerlines,
         )
     else:
         df_tpl = _get_tpl_or_ins_df(
@@ -2247,6 +2554,7 @@ def _write_direct_df_tpl(
     xy_in_idx=None,
     zero_based=True,
     gpname=None,
+    headerlines=None,
 ):
 
     """
@@ -2282,15 +2590,19 @@ def _write_direct_df_tpl(
     Returns:
         pandas.DataFrame with paranme and pargroup define for each `use_col`
 
+    Note:
+        This function is called by `PstFrom` programmatically
+
     """
+    # TODO much of this duplicates what is in _get_tpl_or_ins_df() -- could posssibly be consolidated
     # work out the union of indices across all dfs
 
-    sidx = set()
+    sidx = []
 
-    didx = set(df.loc[:, index_cols].apply(lambda x: tuple(x), axis=1))
-    sidx.update(didx)
+    didx = df.loc[:, index_cols].apply(lambda x: tuple(x), axis=1)
+    sidx.extend(didx)
 
-    df_ti = pd.DataFrame({"sidx": list(sidx)}, columns=["sidx"])
+    df_ti = pd.DataFrame({"sidx": sidx}, columns=["sidx"])
     # get some index strings for naming
     if longnames:
         j = "_"
@@ -2300,7 +2612,7 @@ def _write_direct_df_tpl(
         else:
             inames = ["idx{0}".format(i) for i in range(len(index_cols))]
     else:
-        fmt = "{1|3}"
+        fmt = "{1:3}"
         j = ""
         if isinstance(index_cols[0], str):
             inames = index_cols
@@ -2308,7 +2620,9 @@ def _write_direct_df_tpl(
             inames = ["{0}".format(i) for i in range(len(index_cols))]
 
     if not zero_based:
-        df_ti.loc[:, "sidx"] = df_ti.sidx.apply(lambda x: tuple(xx - 1 for xx in x))
+        df_ti.loc[:, "sidx"] = df_ti.sidx.apply(
+            lambda x: tuple(xx - 1 if isinstance(xx, int) else xx for xx in x)
+        )
     df_ti.loc[:, "idx_strs"] = df_ti.sidx.apply(
         lambda x: j.join([fmt.format(iname, xx) for xx, iname in zip(x, inames)])
     ).str.replace(" ", "")
@@ -2387,7 +2701,7 @@ def _write_direct_df_tpl(
                     df_ti.loc[:, use_col] += suffix
 
             # todo check that values are constant within zones and
-            # assign parval1
+            #  assign parval1
             raise NotImplementedError(
                 "list-based direct zone-type parameters not implemented"
             )
@@ -2421,11 +2735,24 @@ def _write_direct_df_tpl(
                 "should be 'constant','zone', "
                 "or 'grid', not '{0}'".format(typ)
             )
+
+        if not longnames:
+            if df_ti.loc[:, use_col].apply(lambda x: len(x)).max() > 12:
+                too_long = df_ti.loc[:, use_col].apply(lambda x: len(x)) > 12
+                print(too_long)
+                raise ValueError("_write_direct_df_tpl(): couldnt form short par names")
+
         direct_tpl_df.loc[:, use_col] = (
             df_ti.loc[:, use_col].apply(lambda x: "~ {0} ~".format(x)).values
         )
-
-    pyemu.helpers._write_df_tpl(tpl_filename, direct_tpl_df, index=False, header=False)
+    # nasty assumption to distiguish if we need to write headers
+    if isinstance(direct_tpl_df.columns[0], str):
+        header = True
+    else:
+        header = False
+    pyemu.helpers._write_df_tpl(
+        tpl_filename, direct_tpl_df, index=False, header=header, headerlines=headerlines
+    )
 
     return df_ti
 
@@ -2502,7 +2829,7 @@ def _get_tpl_or_ins_df(
         # order matters for obs
         sidx = []
         for df in dfs:
-            didx = df.loc[:, index_cols].apply(lambda x: tuple(x), axis=1).values
+            didx = df.loc[:, index_cols].values
             aidx = [i for i in didx if i not in sidx]
             sidx.extend(aidx)
 
@@ -2510,25 +2837,31 @@ def _get_tpl_or_ins_df(
     # get some index strings for naming
     if longnames:
         j = "_"
-        fmt = "{0}|{1}"
+        # fmt = "{0}|{1}"
         if isinstance(index_cols[0], str):
             inames = index_cols
         else:
             inames = ["idx{0}".format(i) for i in range(len(index_cols))]
+        # full formatter string
+        fmt = j.join([f"{iname}|{{{i}}}" for i, iname in enumerate(inames)])
     else:
-        fmt = "{1:3}"
+        # fmt = "{1:3}"
         j = ""
         if isinstance(index_cols[0], str):
             inames = index_cols
         else:
             inames = ["{0}".format(i) for i in range(len(index_cols))]
-
-    if not zero_based:
-        df_ti.loc[:, "sidx"] = df_ti.sidx.apply(lambda x: tuple(xx - 1 for xx in x))
+        # full formatter string
+        fmt = j.join([f"{{{i}:3}}" for i, iname in enumerate(inames)])
+    if (
+        not zero_based
+    ):  # only if indices are ints (trying to support strings as par ids)
+        df_ti.loc[:, "sidx"] = df_ti.sidx.apply(
+            lambda x: tuple(xx - 1 if isinstance(xx, int) else xx for xx in x)
+        )
 
     df_ti.loc[:, "idx_strs"] = df_ti.sidx.apply(
-        lambda x: j.join([fmt.format(iname, xx) for xx, iname in zip(x, inames)])
-    ).str.replace(" ", "")
+        lambda x: fmt.format(*x)).str.replace(" ", "")
     df_ti.loc[:, "idx_strs"] = df_ti.idx_strs.str.replace(":", "")
     df_ti.loc[:, "idx_strs"] = df_ti.idx_strs.str.replace("|", ":")
 
@@ -2624,6 +2957,12 @@ def _get_tpl_or_ins_df(
                 "should be 'constant','zone', "
                 "or 'grid', not '{0}'".format(typ)
             )
+
+        if not longnames:
+            if df_ti.loc[:, use_col].apply(lambda x: len(x)).max() > 12:
+                too_long = df_ti.loc[:, use_col].apply(lambda x: len(x)) > 12
+                print(too_long)
+                raise ValueError("_get_tpl_or_ins_df(): couldnt form short par names")
     return df_ti
 
 
@@ -2662,6 +3001,9 @@ def write_array_tpl(
     Returns:
         df (`pandas.DataFrame`): a dataframe with parameter information
 
+    Note:
+        This function is called by `PstFrom` programmatically
+
     """
 
     if shape is None and zone_array is None:
@@ -2690,7 +3032,7 @@ def write_array_tpl(
                     input_filename
                 )
             )
-        org_arr = np.loadtxt(input_filename)
+        org_arr = np.loadtxt(input_filename, ndmin=2)
         if par_type == "grid":
             pass
         elif par_type == "constant":
@@ -2811,14 +3153,33 @@ def write_array_tpl(
 
 def _check_diff(org_arr, input_filename, zval=None):
     percent_diff = 100.0 * np.abs(
-        np.nanmax(org_arr) - np.nanmin(org_arr) / np.nanmean(org_arr)
+        (np.nanmax(org_arr) - np.nanmin(org_arr)) / np.nanmean(org_arr)
     )
+
     if percent_diff > DIRECT_PAR_PERCENT_DIFF_TOL:
         message = "_check_diff() error: direct par for file '{0}'".format(
             input_filename
-        ) + "exceeds tolerance for percent difference: {2} > {3}".format(
+        ) + "exceeds tolerance for percent difference: {0} > {1}".format(
             percent_diff, DIRECT_PAR_PERCENT_DIFF_TOL
         )
         if zval is not None:
             message += " in zone {0}".format(zval)
         raise Exception(message)
+
+
+def get_filepath(folder, filename):
+    """Return a path to a file within a folder,
+    without repeating the folder in the output path,
+    if the input filename (path) already contains the folder."""
+    filename = Path(filename)
+    folder = Path(folder)
+    if folder not in filename.parents:
+        filename = folder / filename
+    return filename
+
+
+def get_relative_filepath(folder, filename):
+    """Like :func:`~pyemu.utils.pst_from.get_filepath`, except
+    return path for filename relative to folder.
+    """
+    return get_filepath(folder, filename).relative_to(folder)
