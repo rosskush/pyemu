@@ -6938,9 +6938,10 @@ class GsfReader():
         nodedf = pd.DataFrame(node_data, columns=['Node', 'X', 'Y', 'Z', 'layer', 'numverts', 'vertidx'])
         return nodedf
 
-    def get_node_coordinates(self):
+    def get_node_coordinates(self, zcoord=False):
         '''
-
+        Args:
+            zcoord: if true, add z coord to coordinates
         :return:
             Dictionary containing x and y coordinates for each node
         '''
@@ -6949,5 +6950,7 @@ class GsfReader():
             nid, x, y, z, lay, numverts = self.read_data[self.nvertex + 3 + node].split()[:6]
 
             node_coords[int(nid)] = [float(x), float(y)]
+            if zcoord:
+                node_coords[int(nid)] += [float(z)]
 
         return node_coords
