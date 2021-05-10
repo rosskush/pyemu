@@ -613,7 +613,7 @@ def _parse_ins_string(string):
     istart_markers = set(["[", "(", "!"])
     marker_dict = {"[": "]", "(": ")", "!": "!"}
     # iend_markers = set(["]",")","!"])
-
+    setdum = {"dum", "DUM"}
     obs_names = []
     slen = len(string)
     idx = 0
@@ -629,9 +629,9 @@ def _parse_ins_string(string):
             # print(string[idx+1:])
             # print(string[idx+1:].index(em))
             # print(string[idx+1:].index(em)+idx+1)
-            eidx = min(slen, string[idx + 1 :].index(em) + idx + 1)
-            obs_name = string[idx + 1 : eidx]
-            if obs_name.lower() != "dum":
+            eidx = min(slen, string.find(em, idx + 1))
+            obs_name = string[idx + 1: eidx]
+            if obs_name not in setdum:
                 obs_names.append(obs_name)
             idx = eidx + 1
         else:
@@ -719,27 +719,27 @@ def generic_pst(par_names=["par1"], obs_names=["obs1"], addreg=False):
     return new_pst
 
 
-def try_read_input_file_with_tpl(tpl_file,input_file=None):
+def try_read_input_file_with_tpl(tpl_file, input_file=None):
     """attempt to read parameter values from an input file using a template file
-        Args:
-            tpl_file (`str`): path and name of a template file
-            input_file (`str`,optional): path and name of existing model
-                input file to process.  If `None`, `tpl_file.replace(".tpl","")`
-                is used.  Default is None.
+    Args:
+        tpl_file (`str`): path and name of a template file
+        input_file (`str`,optional): path and name of existing model
+            input file to process.  If `None`, `tpl_file.replace(".tpl","")`
+            is used.  Default is None.
 
-        Returns:
-            `pandas.DataFrame`: a dataframe of parameter name and values
-            extracted from `input_file`.
+    Returns:
+        `pandas.DataFrame`: a dataframe of parameter name and values
+        extracted from `input_file`.
 
-        Note:
-            If an exception is raised when reading the input file, the exception
-            is echoed to the screen and `None` is returned.
+    Note:
+        If an exception is raised when reading the input file, the exception
+        is echoed to the screen and `None` is returned.
 
-        Example::
+    Example::
 
-            df = pyemu.pst_utils.try_process_output_file("my.tpl","my.input")
+        df = pyemu.pst_utils.try_process_output_file("my.tpl","my.input")
 
-        """
+    """
 
     if input_file is None:
         input_file = tpl_file.replace(".tpl", "")
@@ -749,13 +749,14 @@ def try_read_input_file_with_tpl(tpl_file,input_file=None):
     # and also to do some basic error checking
     parnames = parse_tpl_file(tpl_file)
     try:
-        df = _read_infile_with_tplfile(tpl_file,input_file)
+        df = _read_infile_with_tplfile(tpl_file, input_file)
     except Exception as e:
         print("error trying to read input file with tpl file:{0}".format(str(e)))
         return None
     return df
 
-def _read_infile_with_tplfile(tpl_file,input_file):
+
+def _read_infile_with_tplfile(tpl_file, input_file):
     """attempt to read parameter values from an input file using a template file,
     raising heaps of exceptions.
         Args:
@@ -769,65 +770,78 @@ def _read_infile_with_tplfile(tpl_file,input_file):
         Note:
             use try_read_inputfile_with_tpl instead of this one.
 
-        """
+    """
 
     if not os.path.exists(input_file):
-       raise Exception("input file '{0}' not found".format(input_file))
+        raise Exception("input file '{0}' not found".format(input_file))
 
-    f_tpl = open(tpl_file,'r')
-    f_in = open(input_file,'r')
+    f_tpl = open(tpl_file, "r")
+    f_in = open(input_file, "r")
 
     # read the tpl header
     _, marker = f_tpl.readline().split()
-    itpl,iin = 1,0
-    pnames,pvals = [],[]
+    itpl, iin = 1, 0
+    pnames, pvals = [], []
     pdict = {}
     while True:
-        tpl_line =f_tpl.readline()
+        tpl_line = f_tpl.readline()
         if tpl_line == "":
             break
 
         in_line = f_in.readline()
         if in_line == "":
-            raise Exception("input file EOF, tpl file line {0}, in file line {1}".format(itpl,iin))
+            raise Exception(
+                "input file EOF, tpl file line {0}, in file line {1}".format(itpl, iin)
+            )
 
         if marker in tpl_line:
             idxs = [i for i, ltr in enumerate(tpl_line) if ltr == marker]
             if len(idxs) % 2 != 0:
                 raise Exception("unbalanced markers on tpl line {0}".format(itpl))
 
-            for s,e in zip(idxs[0:-1:2],idxs[1::2]):
-                tpl_str = tpl_line[s:e+1]
-                pname = tpl_str.replace(marker,"").strip().lower()
+            for s, e in zip(idxs[0:-1:2], idxs[1::2]):
+                tpl_str = tpl_line[s : e + 1]
+                pname = tpl_str.replace(marker, "").strip().lower()
                 if s > len(in_line):
-                    raise Exception("input file EOL line {0}, tpl line {1}, looking for {2}"\
-                                    .format(iin,itpl,tpl_str))
-                junk_val = 'Jennyigotunumber8675309'
-                tmp = tpl_line[:s] + " {} ".format(junk_val) + tpl_line[e+1:]
+                    raise Exception(
+                        "input file EOL line {0}, tpl line {1}, looking for {2}".format(
+                            iin, itpl, tpl_str
+                        )
+                    )
+                junk_val = "Jennyigotunumber8675309"
+                tmp = tpl_line[:s] + " {} ".format(junk_val) + tpl_line[e + 1 :]
                 if len(tmp.split()) == len(in_line.split()):
                     # treat this as whitespace delimited
                     in_str = in_line.split()[tmp.split().index(junk_val)]
                 else:
                     # or we must assume the params are written using the same spacing as template file
-                    in_str = in_line[s:e+1]
+                    in_str = in_line[s : e + 1]
                 try:
                     v = float(in_str)
                 except Exception as e:
-                    raise Exception("error casting '{0}' to float on in line {1}, tpl line {2} for {3}: {4}".\
-                          format(in_str,iin,itpl,tpl_str,str(e)))
+                    raise Exception(
+                        "error casting '{0}' to float on in line {1}, tpl line {2} for {3}: {4}".format(
+                            in_str, iin, itpl, tpl_str, str(e)
+                        )
+                    )
 
                 if pname in pdict:
                     eval = pdict[pname]
-                    if not np.isclose(eval,v,1.0e-6):
-                        raise Exception("different values {0}:{1} for par {2} on in line {3}".format(v,eval,pname,iin))
+                    if not np.isclose(eval, v, 1.0e-6):
+                        raise Exception(
+                            "different values {0}:{1} for par {2} on in line {3}".format(
+                                v, eval, pname, iin
+                            )
+                        )
                 else:
                     pnames.append(pname)
                     pvals.append(v)
                 pdict[pname] = v
         itpl += 1
         iin += 1
-    df = pd.DataFrame({"parnme":pnames,"parval1":pvals},index=pnames)
+    df = pd.DataFrame({"parnme": pnames, "parval1": pvals}, index=pnames)
     return df
+
 
 def try_process_output_file(ins_file, output_file=None):
     """attempt to process a model output file using a PEST-style instruction file
@@ -1087,7 +1101,7 @@ def csv_to_ins_file(
         rname = str(rname_org).strip().lower()
         if rname in row_visit:
             if longnames:
-                rsuffix = "_"+str(int(row_visit[rname] + 1))
+                rsuffix = "_" + str(int(row_visit[rname] + 1))
             else:
                 rsuffix = str(int(row_visit[rname] + 1))
             row_visit[rname] += 1
@@ -1108,7 +1122,7 @@ def csv_to_ins_file(
         cname = str(cname_org).strip().lower()
         if cname in col_visit:
             if longnames:
-                csuffix = "_"+str(int(col_visit[cname] + 1))
+                csuffix = "_" + str(int(col_visit[cname] + 1))
             else:
                 csuffix = str(int(col_visit[cname] + 1))
             col_visit[cname] += 1
@@ -1121,7 +1135,7 @@ def csv_to_ins_file(
             only_clabels.append(clabel)
     only_clabels = set(only_clabels)
     if len(only_clabels) == 0:
-        print("only_cols:",only_cols)
+        print("only_cols:", only_cols)
         raise Exception("csv_to_ins_file(): only_clabels is empty")
 
     if ins_filename is None:
@@ -1143,11 +1157,11 @@ def csv_to_ins_file(
             f.write("l1\n")  # skip the row (index) label
         for i, rlabel in enumerate(rlabels):  # loop over rows
             f.write("l1")
-            if (rlabel not in only_rlabels):
+            if rlabel not in only_rlabels:
                 f.write("\n")
                 continue
             c_count = 0
-            line = ''
+            line = ""
             for j, clabel in enumerate(clabels):  # loop over columns
 
                 if j == 0:
@@ -1160,9 +1174,8 @@ def csv_to_ins_file(
                             # f.write(" !dum!")
                             line += " !dum! "
 
-
                 if c_count < only_clabels_len:
-                    if clabel in only_clabels:# and rlabel in only_rlabels:
+                    if clabel in only_clabels:  # and rlabel in only_rlabels:
                         oname = ""
                         # define obs names
                         if not prefix_is_str:
@@ -1209,15 +1222,17 @@ def csv_to_ins_file(
                         if j < len(clabels) - 1:
                             if sep == ",":
                                 line += f" {marker},{marker} "
-                            #else:
+                            # else:
                             #    line += " !dum! "
                         c_count += 1
-                    elif j < len(clabels) - 1: # this isnt a row-col to observationalize (nice word!)
+                    elif (
+                        j < len(clabels) - 1
+                    ):  # this isnt a row-col to observationalize (nice word!)
                         if sep == ",":
                             line += f" {marker},{marker} "
                         else:
                             line += " !dum! "
-            f.write(line+"\n")
+            f.write(line + "\n")
     odf = pd.DataFrame(
         {"obsnme": onames, "obsval": ovals, "obgnme": ognames}, index=onames
     ).dropna(
@@ -1425,7 +1440,7 @@ class InstructionFile(object):
             val_dict.update(self._execute_ins_line(ins_line, ins_lcount))
             # except Exception as e:
             #    raise Exception(str(e))
-        df = pd.DataFrame.from_dict(val_dict, orient='index', columns=['obsval'])
+        df = pd.DataFrame.from_dict(val_dict, orient="index", columns=["obsval"])
         # s = pd.Series(val_dict)
         # s.sort_index(inplace=True)
 
@@ -1433,51 +1448,67 @@ class InstructionFile(object):
 
     def _execute_ins_line(self, ins_line, ins_lcount):
         """private method to process output file lines with an instruction line"""
-        cursor_pos = 0
-        val_dict = {}
+        cursor_pos = 0  # starting cursor position
+        val_dict = {}  # storage dict for obsname: obsval pairs in line
         # for ii,ins in enumerate(ins_line):
-        ii = 0
+        ii = 0  # counter over instruction entries
         all_markers = True
         line_seps = set([",", " ", "\t"])
+        n_ins = len(ins_line)  # number of instructions on line
+        maxsearch = 500  # maximum number of characters to search when slicing line
         while True:
-            if ii >= len(ins_line):
+            if ii >= n_ins:
                 break
-            ins = ins_line[ii]
-            i1 = ins[:1]
+            ins = ins_line[ii]  # extract instruction
+            i1 = ins[:1]  # first char in instruction
             # primary marker
             if ii == 0 and i1 == self._marker:
+                # if first and instruction starts with primary marker
+                # search for presence of primary marker e.g. ~start~
                 mstr = ins.replace(self._marker, "")
                 while True:
-                    line = self._readline_output()
+                    # loop over lines until primary marker is found
+                    line = self._readline_output()  # read line from output
                     if line is None:
                         self.throw_out_error(
-                            "EOF when trying to find primary marker '{0}' from instruction file line {1}".format(
+                            "EOF when trying to find primary marker '{0}' from "
+                            "instruction file line {1}".format(
                                 mstr, ins_lcount
                             )
                         )
-                    if mstr in line:
+                    if mstr in line:  # when marker is found break and update
+                        # cursor position in current line
                         break
+                # copy a version of line commas replaced
+                # (to support comma sep strings)
+                rline = line.replace(',', ' ')
                 cursor_pos = line.index(mstr) + len(mstr)
 
             # line advance
-            elif i1 == "l":
+            elif i1 == "l":  # if start of instruction is line advance
                 try:
-                    nlines = int(ins[1:])
+                    nlines = int(ins[1:])  # try and get advance number
                 except Exception as e:
                     self.throw_ins_error(
-                        "casting line advance to int for instruction '{0}'".format(ins),
+                        "casting line advance to int for "
+                        "instruction '{0}'".format(ins),
                         ins_lcount,
                     )
                 for i in range(nlines):
                     line = self._readline_output()
                     if line is None:
                         self.throw_out_error(
-                            "EOF when trying to read {0} lines for line advance instruction '{1}', from instruction file line number {2}".format(
+                            "EOF when trying to read {0} lines for line "
+                            "advance instruction '{1}', from instruction "
+                            "file line number {2}".format(
                                 nlines, ins, ins_lcount
                             )
                         )
+                # copy a version of line commas replaced
+                # (to support comma sep strings)
+                rline = line.replace(',', ' ')
             elif ins == "w":  # whole string comparison
-                raw = line[cursor_pos:].replace(",", " ").split()
+                raw = rline[cursor_pos:cursor_pos+maxsearch].split(None, 2)  # TODO: maybe slow for long strings -- hopefuly maxsearch helps
                 if line[cursor_pos] in line_seps:
                     raw.insert(0, "")
                 if len(raw) == 1:
@@ -1487,26 +1518,42 @@ class InstructionFile(object):
                         )
                     )
                 # step over current value
-                cursor_pos = cursor_pos + line[cursor_pos:].replace(",", " ").index(" ")
+                cursor_pos = rline.find(' ', cursor_pos)
                 # now find position of next entry
-                cursor_pos = cursor_pos + line[cursor_pos:].replace(",", " ").index(
-                    raw[1]
-                )
+                cursor_pos = rline.find(raw[1], cursor_pos)
+                   # raw[1]
+               # )
 
-            elif i1 == "!":
+            elif i1 == "!":  # indicates obs instruction folows
                 oname = ins.replace("!", "")
-                # look a head for a sec marker
-                if ii < len(ins_line) - 1 and ins_line[ii + 1] == self._marker:
+                # look a head for a second/closing marker
+                if ii < n_ins - 1 and ins_line[ii + 1] == self._marker:
+                    # if penultimate instruction and last instruction is
+                    # primary marker, look for that marker in line
                     m = ins_line[ii + 1].replace(self._marker, "")
-                    if m not in line[cursor_pos:]:
+                    es = line.find(m, cursor_pos)
+                    if es == -1:  # m not in rest of line
                         self.throw_out_error(
-                            "secondary marker '{0}' not found from cursor_pos {2}".format(
+                            "secondary marker '{0}' not found from cursor_pos {1}".format(
                                 m, cursor_pos
                             )
                         )
-                    val_str = line[cursor_pos:].split(m)[0]
+                    # read to closing marker
+                    val_str = line[cursor_pos: es]
                 else:
-                    val_str = line[cursor_pos:].replace(",", " ").split()[0]
+                    # find next space in (r)line -- signifies end of entry
+                    es = rline.find(' ', cursor_pos)
+                    if es == -1 or es == cursor_pos:
+                        # if no space or current position is space
+                        # use old fashioned split to get value
+                        # -- this will happen if there are leading blanks before
+                        # vals in output file (e.g. formatted)
+                        val_str = rline[
+                                  cursor_pos: cursor_pos+maxsearch
+                                  ].split(None, 1)[0]
+                    else:
+                        # read val (constrained slice is faster for big strings)
+                        val_str = rline[cursor_pos: es]
                 try:
                     val = float(val_str)
                 except Exception as e:
@@ -1519,31 +1566,32 @@ class InstructionFile(object):
 
                 if oname != "dum":
                     val_dict[oname] = val
-                ipos = line[cursor_pos:].index(val_str.strip())
+                ipos = line.find(val_str.strip(), cursor_pos)
                 # val_len = len(val_str)
-                cursor_pos = (
-                    cursor_pos + line[cursor_pos:].index(val_str.strip()) + len(val_str)
-                )
+                cursor_pos = ipos + len(val_str)  # update cursor
                 all_markers = False
 
             elif i1 == self._marker:
-                m = ins.replace(self._marker, "")
-                if m not in line[cursor_pos:]:
+                m = ins.replace(self._marker, "")  # extract just primary marker
+                # find position of primary marker in line
+                es = line.find(m, cursor_pos)
+                if es == -1:  # m not in rest of line
                     if all_markers:
                         ii = 0
                         continue
                     else:
                         self.throw_out_error(
-                            "secondary marker '{0}' not found from cursor_pos {2}".format(
+                            "secondary marker '{0}' not found from "
+                            "cursor_pos {1}".format(
                                 m, cursor_pos
                             )
                         )
-                cursor_pos = cursor_pos + line[cursor_pos:].index(m) + len(m)
+                cursor_pos = es + len(m)
 
             elif i1 == "(":
                 if ")" not in ins:
                     self.throw_ins_error("unmatched ')'", self._instruction_lcount)
-                oname = ins[1:].split(")")[0].lower()
+                oname = ins[1:].split(")", 1)[0].lower()
                 raw = ins.split(")")[1]
                 if ":" not in raw:
                     self.throw_ins_error(
@@ -1585,7 +1633,7 @@ class InstructionFile(object):
                     )
 
                 ss_idx = max(cursor_pos, s_idx)
-                raw = line[ss_idx:].split()
+                raw = line[ss_idx: ss_idx+maxsearch].split(None, 1)  # slpitting only 1 might be margin faster
                 rs_idx = line.index(raw[0])
                 if rs_idx > e_idx:
                     self.throw_out_error(
@@ -1612,7 +1660,7 @@ class InstructionFile(object):
             elif i1 == "[":
                 if "]" not in ins:
                     self.throw_ins_error("unmatched ']'", self._instruction_lcount)
-                oname = ins[1:].split("]")[0].lower()
+                oname = ins[1:].split("]", 1)[0].lower()
                 raw = ins.split("]")[1]
                 if ":" not in raw:
                     self.throw_ins_error(
@@ -1705,9 +1753,7 @@ class InstructionFile(object):
             #         yield start
             #         start += len(sub)
             # poss speedup using regex
-            midx = [
-                m.start() for m in re.finditer(re.escape(self._marker), line)
-            ]
+            midx = [m.start() for m in re.finditer(re.escape(self._marker), line)]
             # midx = list(find_all(line, self._marker))
             midx.append(len(line))
             first = line[: midx[0]].strip()
@@ -1715,8 +1761,8 @@ class InstructionFile(object):
             if len(first) > 0:
                 tokens.append(first)
             for idx in range(1, len(midx) - 1, 2):
-                mstr = line[midx[idx - 1] : midx[idx] + 1]
-                ostr = line[midx[idx] + 1 : midx[idx + 1]]
+                mstr = line[midx[idx - 1]: midx[idx] + 1]
+                ostr = line[midx[idx] + 1: midx[idx + 1]]
                 tokens.append(mstr)
                 tokens.extend(ostr.split())
         else:

@@ -21,6 +21,7 @@ import pandas as pd
 pd.options.display.max_colwidth = 100
 from ..pyemu_warnings import PyemuWarning
 
+
 try:
     import flopy
 except:
@@ -168,19 +169,22 @@ def geostatistical_draws(
 
                 if verbose:
                     print("getting diag var cov", df_zone.shape[0])
-                # tpl_var = np.diag(full_cov.get(list(df_zone.parnme)).x).max()
-                tpl_var = max([full_cov_dict[pn] for pn in df_zone.parnme])
-
+                
+                #tpl_var = max([full_cov_dict[pn] for pn in df_zone.parnme])
                 if verbose:
                     print("scaling full cov by diag var cov")
-                # cov.x *= tpl_var
-                for i in range(cov.shape[0]):
-                    cov.x[i, :] *= tpl_var
+                
+                # for i in range(cov.shape[0]):
+                #     cov.x[i, :] *= tpl_var
+                for i,name in enumerate(cov.row_names):
+                    #print(name,full_cov_dict[name])
+                    cov.x[:,i] *= np.sqrt(full_cov_dict[name])
+                    cov.x[i, :] *= np.sqrt(full_cov_dict[name])
+                    cov.x[i, i] = full_cov_dict[name]
                 # no fixed values here
                 pe = pyemu.ParameterEnsemble.from_gaussian_draw(
                     pst=pst, cov=cov, num_reals=num_reals, by_groups=False, fill=False
                 )
-                # df = pe.iloc[:,:]
                 par_ens.append(pe._df)
                 pars_in_cov.update(set(pe.columns))
 
@@ -321,15 +325,17 @@ def geostatistical_prior_builder(
                 # find the variance in the diagonal cov
                 if verbose:
                     print("getting diag var cov", df_zone.shape[0])
-                # tpl_var = np.diag(full_cov.get(list(df_zone.parnme)).x).max()
-                tpl_var = max([full_cov_dict[pn] for pn in df_zone.parnme])
-                # if np.std(tpl_var) > 1.0e-6:
-                #    warnings.warn("pars have different ranges" +\
-                #                  " , using max range as variance for all pars")
-                # tpl_var = tpl_var.max()
+
+                #tpl_var = max([full_cov_dict[pn] for pn in df_zone.parnme])
+
                 if verbose:
                     print("scaling full cov by diag var cov")
-                cov *= tpl_var
+
+                #cov *= tpl_var
+                for i,name in enumerate(cov.row_names):
+                    cov.x[:,i] *= np.sqrt(full_cov_dict[name])
+                    cov.x[i, :] *= np.sqrt(full_cov_dict[name])
+                    cov.x[i, i] = full_cov_dict[name]
                 if verbose:
                     print("test for inversion")
                 try:
@@ -510,43 +516,49 @@ def calc_rmse_ensemble(ens, pst, bygroups=True, subset_realizations=None):
     return rmse
 
 
-def _condition_on_par_knowledge(cov, par_knowledge_dict):
-    """experimental function to include conditional prior information
-    for one or more parameters in a full covariance matrix
+def _condition_on_par_knowledge(cov, var_knowledge_dict):
+    """experimental function to condition a covariance matrix with the variances of new information.
+
+    Args:
+        cov (`pyemu.Cov`): prior covariance matrix
+        var_knowledge_dict (`dict`): a dictionary of covariance entries and variances
+
+    Returns:
+        cov (`pyemu.Cov`): the conditional covariance matrix
+
     """
 
     missing = []
-    for parnme in par_knowledge_dict.keys():
-        if parnme not in cov.row_names:
-            missing.append(parnme)
+    for name in var_knowledge_dict.keys():
+        if name not in cov.row_names:
+            missing.append(name)
     if len(missing):
         raise Exception(
-            "par knowledge dict parameters not found: {0}".format(",".join(missing))
+            "var knowledge dict entries not found: {0}".format(",".join(missing))
         )
-    # build the selection matrix and sigma epsilon
-    # sel = pyemu.Cov(x=np.identity(cov.shape[0]),names=cov.row_names)
-    sel = cov.zero2d
-    sel = cov.to_pearson()
-    new_cov_diag = pyemu.Cov(x=np.diag(cov.as_2d.diagonal()), names=cov.row_names)
-    # new_cov_diag = cov.zero2d
+    if cov.isdiagonal:
+        raise Exception("_condition_on_par_knowledge(): cov is diagonal, simply update the par variances")
+    know_names = list(var_knowledge_dict.keys())
+    know_names.sort()
+    know_cross_cov = cov.get(cov.row_names,know_names)
 
-    for parnme, var in par_knowledge_dict.items():
-        idx = cov.row_names.index(parnme)
-        # sel.x[idx,:] = 1.0
-        # sel.x[idx,idx] = var
-        new_cov_diag.x[idx, idx] = var  # cov.x[idx,idx]
-    new_cov_diag = sel * new_cov_diag * sel.T
+    know_cov = cov.get(know_names,know_names)
+    # add the par knowledge to the diagonal of know_cov
+    for i,name in enumerate(know_names):
+        know_cov.x[i,i] += var_knowledge_dict[name]
 
-    for _ in range(2):
-        for parnme, var in par_knowledge_dict.items():
-            idx = cov.row_names.index(parnme)
-            # sel.x[idx,:] = 1.0
-            # sel.x[idx,idx] = var
-            new_cov_diag.x[idx, idx] = var  # cov.x[idx,idx]
-        new_cov_diag = sel * new_cov_diag * sel.T
+    # kalman gain
+    k_gain = know_cross_cov * know_cov.inv
+    #selection matrix
+    h = k_gain.zero2d.T
+    know_dict = {n:i for i,n in enumerate(know_names)}
+    for i,name in enumerate(cov.row_names):
+        if name in know_dict:
+            h.x[know_dict[name],i] = 1.0
 
-    print(new_cov_diag)
-    return new_cov_diag
+    prod = k_gain * h
+    conditional_cov = (prod.identity - prod) * cov
+    return conditional_cov
 
 
 def kl_setup(
@@ -2345,7 +2357,7 @@ class PstFromFlopyModel(object):
             mlt_df.loc[mlt_df.mlt_file == out_file, "pp_file"] = pp_file
             mlt_df.loc[mlt_df.mlt_file == out_file, "pp_fill_value"] = 1.0
             mlt_df.loc[mlt_df.mlt_file == out_file, "pp_lower_limit"] = 1.0e-10
-            mlt_df.loc[mlt_df.mlt_file == out_file, "pp_upper_limit"] = 1.0e+10
+            mlt_df.loc[mlt_df.mlt_file == out_file, "pp_upper_limit"] = 1.0e10
 
         self.par_dfs[self.pp_suffix] = pp_df
 
@@ -2414,7 +2426,7 @@ class PstFromFlopyModel(object):
             ]
             mlt_df.loc[mlt_df.prefix == prefix, "pp_fill_value"] = 1.0
             mlt_df.loc[mlt_df.prefix == prefix, "pp_lower_limit"] = 1.0e-10
-            mlt_df.loc[mlt_df.prefix == prefix, "pp_upper_limit"] = 1.0e+10
+            mlt_df.loc[mlt_df.prefix == prefix, "pp_upper_limit"] = 1.0e10
 
         print(kl_mlt_df)
         mlt_df.loc[mlt_df.suffix == self.kl_suffix, "tpl_file"] = np.NaN
@@ -3709,10 +3721,24 @@ def apply_array_pars(arr_par="arr_pars.csv", arr_par_file=None, chunk_len=50):
 
     if "pp_file" in df.columns:
         print("starting fac2real", datetime.now())
-        pp_df = df.loc[df.pp_file.notna(), ["pp_file", "fac_file", "mlt_file",
-                                            "pp_fill_value","pp_lower_limit","pp_upper_limit"]].rename(
-            columns={"fac_file": "factors_file", "mlt_file": "out_file",
-                     "pp_fill_value":"fill_value","pp_lower_limit":"lower_lim","pp_upper_limit":"upper_lim"}
+        pp_df = df.loc[
+            df.pp_file.notna(),
+            [
+                "pp_file",
+                "fac_file",
+                "mlt_file",
+                "pp_fill_value",
+                "pp_lower_limit",
+                "pp_upper_limit",
+            ],
+        ].rename(
+            columns={
+                "fac_file": "factors_file",
+                "mlt_file": "out_file",
+                "pp_fill_value": "fill_value",
+                "pp_lower_limit": "lower_lim",
+                "pp_upper_limit": "upper_lim",
+            }
         )
         # don't need to process all (e.g. if const. mults apply across kper...)
         pp_args = pp_df.drop_duplicates().to_dict("records")
@@ -3725,7 +3751,7 @@ def apply_array_pars(arr_par="arr_pars.csv", arr_par_file=None, chunk_len=50):
         )
         remainder = np.array(pp_args)[num_chunk_floor * chunk_len :].tolist()
         chunks = main_chunks + [remainder]
-        print("number of chunks to process:",len(chunks))
+        print("number of chunks to process:", len(chunks))
         if len(chunks) == 1:
             _process_chunk_fac2real(chunks[0], 0)
         else:
@@ -3760,7 +3786,7 @@ def apply_array_pars(arr_par="arr_pars.csv", arr_par_file=None, chunk_len=50):
     chunks = main_chunks + [remainder]
     print("number of chunks to process:", len(chunks))
     if len(chunks) == 1:
-        _process_chunk_array_files(chunks[0],0,df)
+        _process_chunk_array_files(chunks[0], 0, df)
     # procs = []
     # for chunk in chunks:  # now only spawn processor for each chunk
     #     p = mp.Process(target=_process_chunk_model_files, args=[chunk, df])
@@ -3930,17 +3956,23 @@ def calc_array_par_summary_stats(arr_par_file="mult2model_info.csv"):
 
     """
     df = pd.read_csv(arr_par_file, index_col=0)
-    df = df.loc[df.index_cols.isna(),:].copy()
+    df = df.loc[df.index_cols.isna(), :].copy()
     if df.shape[0] == 0:
         return None
     model_input_files = df.model_file.unique()
     model_input_files.sort()
     records = dict()
-    stat_dict = {"mean":np.nanmean,"stdev":np.nanstd,"median":np.nanmedian,"min":np.nanmin,"max":np.nanmax}
-    quantiles = [0.05,0.25,0.75,0.95]
+    stat_dict = {
+        "mean": np.nanmean,
+        "stdev": np.nanstd,
+        "median": np.nanmedian,
+        "min": np.nanmin,
+        "max": np.nanmax,
+    }
+    quantiles = [0.05, 0.25, 0.75, 0.95]
     for stat in stat_dict.keys():
         records[stat] = []
-        records[stat+"_org"] = []
+        records[stat + "_org"] = []
         records[stat + "_dif"] = []
 
     for q in quantiles:
@@ -3957,34 +3989,36 @@ def calc_array_par_summary_stats(arr_par_file="mult2model_info.csv"):
     for model_input_file in model_input_files:
 
         arr = np.loadtxt(model_input_file)
-        org_file = df.loc[df.model_file==model_input_file,"org_file"].values
+        org_file = df.loc[df.model_file == model_input_file, "org_file"].values
         org_file = org_file[0]
         org_arr = np.loadtxt(org_file)
         if "zone_file" in df.columns:
             zone_file = df.loc[df.model_file == model_input_file,"zone_file"].dropna().unique()
+            zone_arr = None
             if len(zone_file) > 1:
                 zone_arr = np.zeros_like(arr)
                 for zf in zone_file:
                     za = np.loadtxt(zf)
                     zone_arr[za!=0] = 1
-            else:
+            elif len(zone_file) == 1:
                 zone_arr = np.loadtxt(zone_file[0])
-            arr[zone_arr==0] = np.NaN
-            org_arr[zone_arr==0] = np.NaN
+            if zone_arr is not None:
+                arr[zone_arr==0] = np.NaN
+                org_arr[zone_arr==0] = np.NaN
 
-        for stat,func in stat_dict.items():
+        for stat, func in stat_dict.items():
             v = func(arr)
             records[stat].append(v)
             ov = func(org_arr)
-            records[stat+"_org"].append(ov)
-            records[stat+"_dif"].append(ov-v)
+            records[stat + "_org"].append(ov)
+            records[stat + "_dif"].append(ov - v)
         for q in quantiles:
-            v = np.nanquantile(arr,q)
-            ov = np.nanquantile(org_arr,q)
+            v = np.nanquantile(arr, q)
+            ov = np.nanquantile(org_arr, q)
             records["quantile_{0}".format(q)].append(v)
             records["quantile_{0}_org".format(q)].append(ov)
-            records["quantile_{0}_dif".format(q)].append(ov-v)
-        ub = df.loc[df.model_file==model_input_file,"upper_bound"].max()
+            records["quantile_{0}_dif".format(q)].append(ov - v)
+        ub = df.loc[df.model_file == model_input_file, "upper_bound"].max()
         lb = df.loc[df.model_file == model_input_file, "lower_bound"].min()
         if pd.isna(ub):
             records["upper_bound"].append(0)
@@ -3993,14 +4027,14 @@ def calc_array_par_summary_stats(arr_par_file="mult2model_info.csv"):
 
         else:
             iarr = np.zeros_like(arr)
-            iarr[arr==ub] = 1
+            iarr[arr == ub] = 1
             v = iarr.sum()
             iarr = np.zeros_like(arr)
             iarr[org_arr == ub] = 1
             ov = iarr.sum()
             records["upper_bound"].append(v)
             records["upper_bound_org"].append(ov)
-            records["upper_bound_dif"].append(ov-v)
+            records["upper_bound_dif"].append(ov - v)
 
         if pd.isna(lb):
             records["lower_bound"].append(0)
@@ -4009,23 +4043,27 @@ def calc_array_par_summary_stats(arr_par_file="mult2model_info.csv"):
 
         else:
             iarr = np.zeros_like(arr)
-            iarr[arr==lb] = 1
+            iarr[arr == lb] = 1
             v = iarr.sum()
             iarr = np.zeros_like(arr)
             iarr[org_arr == lb] = 1
             ov = iarr.sum()
             records["lower_bound"].append(v)
             records["lower_bound_org"].append(ov)
-            records["lower_bound_dif"].append(ov-v)
+            records["lower_bound_dif"].append(ov - v)
 
-    #scrub model input files
-    model_input_files = [f.replace(".","_").replace("\\","_").replace("/","_") for f in model_input_files]
-    df = pd.DataFrame(records,index=model_input_files)
+    # scrub model input files
+    model_input_files = [
+        f.replace(".", "_").replace("\\", "_").replace("/", "_")
+        for f in model_input_files
+    ]
+    df = pd.DataFrame(records, index=model_input_files)
     df.index.name = "model_file"
     df.to_csv("arr_par_summary.csv")
     return df
 
-def apply_genericlist_pars(df,chunk_len=50):
+
+def apply_genericlist_pars(df, chunk_len=50):
     """a function to apply list style mult parameters
 
     Args:
@@ -4054,11 +4092,11 @@ def apply_genericlist_pars(df,chunk_len=50):
     main_chunks = (
         uniq[: num_chunk_floor * chunk_len].reshape([-1, chunk_len]).tolist()
     )  # the list of files broken down into chunks
-    remainder = uniq[num_chunk_floor * chunk_len:].tolist()  # remaining files
+    remainder = uniq[num_chunk_floor * chunk_len :].tolist()  # remaining files
     chunks = main_chunks + [remainder]
-    print("number of chunks to process:",len(chunks))
-    if (len(chunks) == 1):
-        _process_chunk_list_files(chunks[0],0,df)
+    print("number of chunks to process:", len(chunks))
+    if len(chunks) == 1:
+        _process_chunk_list_files(chunks[0], 0, df)
     else:
         pool = mp.Pool()
         x = [
@@ -4070,22 +4108,23 @@ def apply_genericlist_pars(df,chunk_len=50):
         pool.join()
     print("finished list mlt", datetime.now())
 
+
 def _process_chunk_list_files(chunk, i, df):
     for model_file in chunk:
         _process_list_file(model_file, df)
     print("process", i, " processed ", len(chunk), "process_list_file calls")
 
 
-def _process_list_file(model_file,df):
+def _process_list_file(model_file, df):
 
-    #print("processing model file:", model_file)
+    # print("processing model file:", model_file)
     df_mf = df.loc[df.model_file == model_file, :].copy()
     # read data stored in org (mults act on this)
     org_file = df_mf.org_file.unique()
     if org_file.shape[0] != 1:
         raise Exception("wrong number of org_files for {0}".format(model_file))
     org_file = org_file[0]
-    #print("org file:", org_file)
+    # print("org file:", org_file)
     notfree = df_mf.fmt[df_mf.fmt != "free"]
     if len(notfree) > 1:
         raise Exception(
@@ -4136,8 +4175,8 @@ def _process_list_file(model_file,df):
     org_data = pd.read_csv(org_file, skiprows=datastrtrow, header=header)
     # mult columns will be string type, so to make sure they align
     org_data.columns = org_data.columns.astype(str)
-    #print("org_data columns:", org_data.columns)
-    #print("org_data shape:", org_data.shape)
+    # print("org_data columns:", org_data.columns)
+    # print("org_data shape:", org_data.shape)
     new_df = org_data.copy()
     for mlt in df_mf.itertuples():
 
@@ -4179,23 +4218,17 @@ def _process_list_file(model_file,df):
             if mlts.index.nlevels < 2:  # just in case only one index col is used
                 mlts.index = mlts.index.get_level_values(0)
             common_idx = (
-                new_df.index.intersection(mlts.index)
-                .sort_values()
-                .drop_duplicates()
+                new_df.index.intersection(mlts.index).sort_values().drop_duplicates()
             )
             mlt_cols = [str(col) for col in mlt.use_cols]
             new_df.loc[common_idx, mlt_cols] = (
                 new_df.loc[common_idx, mlt_cols] * mlts.loc[common_idx, mlt_cols]
             ).values
         # bring mult index back to columns AND re-order
-        new_df = (
-            new_df.reset_index().set_index("oidx")[org_data.columns].sort_index()
-        )
+        new_df = new_df.reset_index().set_index("oidx")[org_data.columns].sort_index()
     if "upper_bound" in df.columns:
         ub = df_mf.apply(
-            lambda x: pd.Series(
-                {str(c): b for c, b in zip(x.use_cols, x.upper_bound)}
-            ),
+            lambda x: pd.Series({str(c): b for c, b in zip(x.use_cols, x.upper_bound)}),
             axis=1,
         ).max()
         if ub.notnull().any():
@@ -4203,9 +4236,7 @@ def _process_list_file(model_file,df):
                 new_df.loc[new_df.loc[:, col] > val, col] = val
     if "lower_bound" in df.columns:
         lb = df_mf.apply(
-            lambda x: pd.Series(
-                {str(c): b for c, b in zip(x.use_cols, x.lower_bound)}
-            ),
+            lambda x: pd.Series({str(c): b for c, b in zip(x.use_cols, x.lower_bound)}),
             axis=1,
         ).min()
         if lb.notnull().any():
@@ -4219,9 +4250,7 @@ def _process_list_file(model_file,df):
             fo.write("\n".join(storehead))
             fo.flush()
         if fmt.lower() == "free":
-            new_df.to_csv(
-                fo, index=False, mode="a", sep=sep, header=hheader, **kwargs
-            )
+            new_df.to_csv(fo, index=False, mode="a", sep=sep, header=hheader, **kwargs)
         else:
             np.savetxt(fo, np.atleast_2d(new_df.values), fmt=fmt)
 
@@ -4320,12 +4349,12 @@ def write_grid_tpl(
                     pname = " 1.0 "
                 else:
                     if longnames:
-                        pname = "{0}_i:{0}_j:{1}_{2}".format(name, i, j, suffix)
+                        pname = "{0}_i:{1}_j:{2}_{3}".format(name, i, j, suffix)
                         if spatial_reference is not None:
                             pname += "_x:{0:10.2E}_y:{1:10.2E}".format(
                                 spatial_reference.xcentergrid[i, j],
                                 spatial_reference.ycentergrid[i, j],
-                            )
+                            ).replace(" ","")
                     else:
                         pname = "{0}{1:03d}{2:03d}".format(name, i, j)
                         if len(pname) > 12:
@@ -6890,6 +6919,7 @@ def _l2_maha_worker(o1, o2names, mean, var, cov, results, l2_crit_val):
     results.update(rresults)
     print(o1, "done")
 
+<<<<<<< HEAD
 
 class GsfReader():
     '''
@@ -6954,3 +6984,5 @@ class GsfReader():
                 node_coords[int(nid)] += [float(z)]
 
         return node_coords
+=======
+>>>>>>> 338f395a839935f1f4f9a1ea98c75a2cc148828f

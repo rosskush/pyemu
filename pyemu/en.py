@@ -8,7 +8,7 @@ import pyemu
 from .pyemu_warnings import PyemuWarning
 
 SEED = 358183147  # from random.org on 5 Dec 2016
-
+np.random.seed(SEED)
 
 class Loc(object):
     """thin wrapper around `pandas.DataFrame.loc` to make sure returned type
@@ -404,7 +404,12 @@ class Ensemble(object):
             retrans = True
         if self._df.isnull().values.any():
             warnings.warn("NaN in ensemble", PyemuWarning)
-        pyemu.Matrix.write_dense(filename,self._df.index.tolist(),self._df.columns.tolist(),self._df.values)
+        pyemu.Matrix.write_dense(
+            filename,
+            self._df.index.tolist(),
+            self._df.columns.tolist(),
+            self._df.values,
+        )
         if retrans:
             self.transform()
 
